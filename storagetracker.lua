@@ -1,13 +1,15 @@
 --------------------------------------------------------------------------
 -- STORAGE NETWORK MONITOR
--- Reads Create (6.0+) Logistics Networks via one or more Stock Tickers
--- (bound to Vaults through Stock Links) and displays a tabbed dashboard
--- on an attached monitor. Supports multiple independent vault networks
--- at once (one Stock Ticker per network).
+-- Per-vault mode: wire a Wired Modem directly to each Create Item Vault
+-- (and/or chest/barrel) you want tracked -- CC:Tweaked sees each as a
+-- generic "inventory" peripheral, giving a true per-vault breakdown
+-- instead of a network-wide aggregate. Create_StockTicker peripherals
+-- (whole Logistics Network totals) are still supported and can be mixed
+-- in alongside individual vaults.
 --
 -- Controls:
 --   Monitor (touch)   - switch tabs, page through items, sort, filter by
---                        network
+--                        source
 --   Computer terminal - type commands: search <text> | sort name|qty
 --                        | clear | sources | refresh | help
 --------------------------------------------------------------------------
@@ -21,10 +23,12 @@ local CONFIG = {
   lowStockThreshold       = 64,    -- items below this count are flagged low
   topCount                = 15,    -- how many items to show on the Top tab
   moversCount             = 15,    -- how many items to show on the Movers tab
-  includeRawInventories   = false, -- also scan plain chest/barrel peripherals
+  includeInventories      = true,  -- scan generic "inventory" peripherals (Vaults, chests, barrels...)
+  includeStockTickers     = true,  -- also scan Create_StockTicker peripherals (whole-network totals)
   monitorScale            = 1,     -- 1 = normal readable size
-  -- Give friendly names to specific Stock Ticker peripherals, e.g.
-  --   ["stockTicker_3"] = "Main Base Vaults",
+  -- Give friendly names to specific peripherals, e.g.
+  --   ["inventory_3"] = "Iron Farm Vault",
+  --   ["stockTicker_7"] = "Main Base Network",
   sourceLabels            = {},
 }
 --==========================================================================
@@ -45,16 +49,16 @@ local COLOR = {
   tabOn      = colors.cyan,
   tabOffText = colors.white,
   tabOnText  = colors.black,
-  barUp      = colors.lime,
-  barDown    = colors.red,
-  barFlat    = colors.cyan,
+  button     = colors.blue,
 }
 
--- CP437 box-drawing characters (CC's font is CP437-based)
-local BOX = {
-  h = string.char(196), v = string.char(179),
-  tl = string.char(218), tr = string.char(191),
-  bl = string.char(192), br = string.char(217),
+-- CP437 shading/box characters (CC's font is CP437-based)
+local CH = {
+  hline  = string.char(196),
+  shade1 = string.char(176), -- light
+  shade2 = string.char(177), -- medium
+  shade3 = string.char(178), -- dark
+  block  = string.char(219), -- full
 }
 
 --------------------------------------------------------------------------
@@ -84,8 +88,8 @@ local monitor, mon
 
 local function friendlyLabel(name, kind, index)
   if CONFIG.sourceLabels[name] then return CONFIG.sourceLabels[name] end
-  if kind == "stockTicker" then return ("Vault Network #%d"):format(index) end
-  return ("Inventory: %s"):format(name)
+  if kind == "stockTicker" then return ("Network #%d"):format(index) end
+  return ("Vault #%d"):format(index)
 end
 
 local function discoverSources()
@@ -94,19 +98,19 @@ local function discoverSources()
   for _, name in ipairs(peripheral.getNames()) do
     local ok, ptype = pcall(peripheral.getType, name)
     if ok then
-      if ptype == "Create_StockTicker" then
+      if CONFIG.includeStockTickers and ptype == "Create_StockTicker" then
         stockTickerCount = stockTickerCount + 1
         table.insert(sources, {
           name = name, kind = "stockTicker", p = peripheral.wrap(name),
           label = friendlyLabel(name, "stockTicker", stockTickerCount),
-          lastGood = nil, stale = false,
+          lastGood = nil, stale = false, slots = nil,
         })
-      elseif CONFIG.includeRawInventories and ptype == "inventory" then
+      elseif CONFIG.includeInventories and ptype == "inventory" then
         invCount = invCount + 1
         table.insert(sources, {
           name = name, kind = "inventory", p = peripheral.wrap(name),
           label = friendlyLabel(name, "inventory", invCount),
-          lastGood = nil, stale = false,
+          lastGood = nil, stale = false, slots = nil,
         })
       end
     end
@@ -132,9 +136,9 @@ end
 -- Scanning / aggregation
 --------------------------------------------------------------------------
 
-local items = {}          -- name -> {name, displayName, count, perSource={label=count}}
+local items = {}
 local previousItems = {}
-local history = {}        -- {t=epochMs, total=n}
+local history = {}
 local totalItems, uniqueItems = 0, 0
 local lastScanTime = 0
 local lastScanOk, lastScanErr = true, nil
@@ -160,6 +164,9 @@ local function readSource(src)
     if not list then list, err = safeCall(src.p.list) end
   else
     list, err = safeCall(src.p.list)
+    if list then
+      src.slots = select(1, safeCall(src.p.size))
+    end
   end
   return list, err
 end
@@ -176,14 +183,16 @@ local function scanAll()
     if list then
       -- Cache a good read so a transient failure next tick doesn't
       -- create a fake dip in the totals / throughput graph.
-      local snapshot = {}
+      local snapshot, usedSlots = {}, 0
       for _, entry in pairs(list) do
+        usedSlots = usedSlots + 1
         local name, display, count = extractEntry(entry)
         if count and count > 0 then
           snapshot[name] = { displayName = display, count = (snapshot[name] and snapshot[name].count or 0) + count }
         end
       end
       src.lastGood = snapshot
+      src.usedSlots = usedSlots
       src.stale = false
     else
       src.stale = true
@@ -226,7 +235,7 @@ local function itemsPerMinute()
     ref = history[i]
   end
   local dtMin = (now - ref.t) / 60000
-  if dtMin < (CONFIG.rateWindowSeconds / 60) * 0.5 then return nil end -- not enough data yet
+  if dtMin < (CONFIG.rateWindowSeconds / 60) * 0.5 then return nil end
   return (history[#history].total - ref.total) / dtMin
 end
 
@@ -274,19 +283,19 @@ end
 
 local TABS = {
   { id = "overview", label = "Overview" },
-  { id = "items",    label = "All Items" },
-  { id = "top",      label = "Top Items" },
-  { id = "low",      label = "Low Stock" },
+  { id = "items",    label = "Items" },
+  { id = "top",      label = "Top" },
+  { id = "low",      label = "Low" },
   { id = "movers",   label = "Movers" },
-  { id = "sources",  label = "Sources" },
+  { id = "sources",  label = "Vaults" },
 }
 
 local ui = {
   view = "overview",
   page = 1,
-  sortMode = "qty",       -- "qty" | "name"
+  sortMode = "qty",
   searchTerm = nil,
-  networkFilter = 0,      -- 0 = all, else index into sources
+  networkFilter = 0,
   touchZones = {},
 }
 
@@ -317,10 +326,16 @@ end
 
 local function clearZones() ui.touchZones = {} end
 local function registerZone(x1, y, x2, action)
+  local w = select(1, mon.getSize())
+  if x1 > w or x1 < 1 then return end
+  if x2 > w then x2 = w end
   table.insert(ui.touchZones, { x1 = x1, y1 = y, x2 = x2, y2 = y, action = action })
 end
 
 local function writeAt(x, y, text, fg, bg)
+  local w, h = mon.getSize()
+  if x > w or x < 1 or y < 1 or y > h then return end
+  if x + #text - 1 > w then text = text:sub(1, w - x + 1) end
   mon.setCursorPos(x, y)
   mon.setTextColor(fg or COLOR.text)
   mon.setBackgroundColor(bg or COLOR.bg)
@@ -338,7 +353,7 @@ local function fillRow(y, bg)
 end
 
 local function hline(x, y, w, color)
-  writeAt(x, y, string.rep(BOX.h, w), color or COLOR.border)
+  writeAt(x, y, string.rep(CH.hline, w), color or COLOR.border)
 end
 
 local function centerText(y, text, fg, bg)
@@ -365,19 +380,30 @@ local function fmtDuration(ms)
   return ("%ds"):format(s)
 end
 
--- A stat "tile": label on top, big value below, optional colored value.
-local function statTile(x, y, w, label, value, valueColor)
+local function statTile(x, y, label, value, valueColor)
   writeAt(x, y, label, COLOR.dim)
   writeAt(x, y + 1, value, valueColor or COLOR.title)
 end
 
+-- Column positions scale with monitor width instead of being fixed, so
+-- layout holds together on both small and large monitors.
+local function columns(w)
+  local qty = math.max(26, math.floor(w * 0.42))
+  local pct = qty + 9
+  local extra = pct + 9
+  return { name = 2, qty = qty, pct = pct, extra = extra }
+end
+
 --------------------------------------------------------------------------
--- Trend graph: scaled to the *visible range* (not 0), so real movement
--- is actually visible instead of a solid-looking block, and each column
--- is colored by whether it went up/down/flat vs the previous sample.
+-- Trend graph: a single-row shaded sparkline in ONE color (no more
+-- multi-color block wall), plus plain numeric stats above it.
 --------------------------------------------------------------------------
 
-local function drawTrendGraph(x, y, w, h)
+local SHADES = { CH.shade1, CH.shade2, CH.shade3, CH.block }
+
+local function drawTrendGraph(x, y, w)
+  local _, monH = mon.getSize()
+  if y < 1 or y > monH then return end
   local n = #history
   if n < 2 then
     writeAt(x, y, "Collecting data...", COLOR.dim)
@@ -395,81 +421,100 @@ local function drawTrendGraph(x, y, w, h)
   local range = maxV - minV
   if range == 0 then range = math.max(1, maxV * 0.01) end
 
-  for col, s in ipairs(visible) do
-    local frac = (s.total - minV) / range
-    local filledRows = math.max(1, math.floor(frac * h + 0.5))
-    local prev = visible[col - 1]
-    local barColor = COLOR.barFlat
-    if prev then
-      if s.total > prev.total then barColor = COLOR.barUp
-      elseif s.total < prev.total then barColor = COLOR.barDown end
-    end
-    for row = 1, h do
-      local screenY = y + (h - row)
-      mon.setCursorPos(x + col - 1, screenY)
-      mon.setBackgroundColor(row <= filledRows and barColor or colors.gray)
-      mon.write(" ")
-    end
-  end
+  mon.setCursorPos(x, y)
   mon.setBackgroundColor(COLOR.bg)
+  mon.setTextColor(COLOR.accent)
+  local line = {}
+  for _, s in ipairs(visible) do
+    local frac = (s.total - minV) / range
+    local idx = math.max(1, math.min(#SHADES, math.floor(frac * #SHADES) + 1))
+    table.insert(line, SHADES[idx])
+  end
+  mon.write(table.concat(line))
+  mon.setTextColor(COLOR.text)
 
-  writeAt(x, y + h, "min " .. fmt(minV), COLOR.dim)
+  writeAt(x, y + 1, "min " .. fmt(minV), COLOR.dim)
   local maxLabel = "max " .. fmt(maxV)
-  writeAt(x + w - #maxLabel, y + h, maxLabel, COLOR.dim)
+  writeAt(x + w - #maxLabel, y + 1, maxLabel, COLOR.dim)
 end
 
 --------------------------------------------------------------------------
--- Header / tab bar (shared across all views)
+-- Header / tab bar (shared across all views) -- wraps to multiple rows
+-- instead of running off the edge of narrow monitors.
 --------------------------------------------------------------------------
 
+local function layoutTabs(w)
+  local rows = { {} }
+  local rowIndex = 1
+  local x = 2
+  for _, tab in ipairs(TABS) do
+    local label = " " .. tab.label .. " "
+    if x + #label - 1 > w - 1 and #rows[rowIndex] > 0 then
+      rowIndex = rowIndex + 1
+      rows[rowIndex] = {}
+      x = 2
+    end
+    table.insert(rows[rowIndex], { tab = tab, x = x, w = #label })
+    x = x + #label + 1
+  end
+  return rows
+end
+
+-- Returns the first free content row below the header.
 local function drawHeader(w)
   fillRow(1, COLOR.panel)
   centerText(1, "STORAGE NETWORK MONITOR", COLOR.title, COLOR.panel)
 
-  fillRow(2, COLOR.bg)
-  local tx = 2
-  for _, tab in ipairs(TABS) do
-    local active = ui.view == tab.id
-    local label = " " .. tab.label .. " "
-    writeAt(tx, 2, label, active and COLOR.tabOnText or COLOR.tabOffText, active and COLOR.tabOn or COLOR.tabOff)
-    registerZone(tx, 2, tx + #label - 1, { type = "view", value = tab.id })
-    tx = tx + #label + 1
+  local rows = layoutTabs(w)
+  for r, rowTabs in ipairs(rows) do
+    local y = 1 + r
+    fillRow(y, COLOR.bg)
+    for _, item in ipairs(rowTabs) do
+      local active = ui.view == item.tab.id
+      writeAt(item.x, y, " " .. item.tab.label .. " ",
+        active and COLOR.tabOnText or COLOR.tabOffText,
+        active and COLOR.tabOn or COLOR.tabOff)
+      registerZone(item.x, y, item.x + item.w - 1, { type = "view", value = item.tab.id })
+    end
   end
-  hline(1, 3, w, COLOR.border)
+
+  local hlineY = 1 + #rows + 1
+  hline(1, hlineY, w, COLOR.border)
+  return hlineY + 1
 end
 
-local function drawNetworkChips(y)
+local function drawSourceChips(y, w)
   local tx = 2
   local function chip(label, active, action)
     local text = " " .. label .. " "
+    if tx + #text - 1 > w then return end
     writeAt(tx, y, text, active and COLOR.tabOnText or COLOR.dim, active and COLOR.tabOn or COLOR.bg)
     registerZone(tx, y, tx + #text - 1, action)
     tx = tx + #text + 1
   end
-  chip("All Networks", ui.networkFilter == 0, { type = "network", value = 0 })
+  chip("All", ui.networkFilter == 0, { type = "network", value = 0 })
   for i, src in ipairs(sources) do
-    local label = src.label .. (src.stale and " (stale)" or "")
-    chip(label, ui.networkFilter == i, { type = "network", value = i })
+    chip(src.label .. (src.stale and "!" or ""), ui.networkFilter == i, { type = "network", value = i })
   end
+  return y + 1
 end
 
-local function drawFooter(h, w, extra)
+local function drawFooter(h, w)
   hline(1, h - 1, w, COLOR.border)
   local scanAgeSec = math.floor((os.epoch("utc") - lastScanTime) / 1000)
-  local status = ("Last scan: %ds ago | every %ds | uptime %s"):format(
+  local status = ("Scan: %ds ago | every %ds | up %s"):format(
     scanAgeSec, CONFIG.refreshInterval, fmtDuration(os.epoch("utc") - startTime))
   writeAt(2, h, status, COLOR.dim)
   if not lastScanOk then
-    writeAt(w - 14, h, "SCAN ERROR", COLOR.bad)
+    writeAt(math.max(2, w - 11), h, "SCAN ERROR", COLOR.bad)
   end
-  if extra then extra() end
 end
 
 --------------------------------------------------------------------------
 -- View: Overview
 --------------------------------------------------------------------------
 
-local function drawOverview(w, h)
+local function drawOverview(w, h, top)
   local rate = itemsPerMinute()
   local rateStr, rateColor
   if rate == nil then
@@ -478,57 +523,77 @@ local function drawOverview(w, h)
     rateStr = (rate >= 0 and "+" or "") .. fmt(rate) .. "/min"
     rateColor = rate > 0 and COLOR.good or (rate < 0 and COLOR.bad or COLOR.dim)
   end
-
   local _, lowN = lowStockItems(nil)
+  local cols = columns(w)
+  local tileW = math.max(16, math.floor((w - 4) / 4))
 
-  local row1 = 5
-  statTile(2, row1, 20, "TOTAL ITEMS", fmt(totalItems), COLOR.accent)
-  statTile(22, row1, 20, "UNIQUE ITEMS", fmt(uniqueItems), COLOR.accent)
-  statTile(42, row1, 20, "NETWORKS", tostring(#sources), COLOR.accent)
-  statTile(58, row1, 20, ("THROUGHPUT (%ds)"):format(CONFIG.rateWindowSeconds), rateStr, rateColor)
+  -- Reserve the footer's 2 rows (hline + status); nothing below this
+  -- line, and every section below is skipped once it would cross it.
+  local maxY = h - 2
+
+  local row1 = top + 1
+  if row1 + 1 <= maxY then
+    statTile(2, row1, "TOTAL ITEMS", fmt(totalItems), COLOR.accent)
+    statTile(2 + tileW, row1, "UNIQUE ITEMS", fmt(uniqueItems), COLOR.accent)
+    statTile(2 + tileW * 2, row1, "SOURCES", tostring(#sources), COLOR.accent)
+    statTile(2 + tileW * 3, row1, ("RATE (%ds)"):format(CONFIG.rateWindowSeconds), rateStr, rateColor)
+  end
 
   local row2 = row1 + 3
-  statTile(2, row2, 20, "LOW STOCK ITEMS", tostring(lowN), lowN > 0 and COLOR.warn or COLOR.good)
-  local avg = uniqueItems > 0 and (totalItems / uniqueItems) or 0
-  statTile(22, row2, 20, "AVG STACK/ITEM", fmt(avg), COLOR.text)
-  local staleCount = 0
-  for _, s in ipairs(sources) do if s.stale then staleCount = staleCount + 1 end end
-  statTile(42, row2, 20, "NETWORKS STALE", tostring(staleCount), staleCount > 0 and COLOR.warn or COLOR.good)
-
-  local graphY = row2 + 4
-  writeAt(2, graphY - 1, "TOTAL ITEM TREND", COLOR.dim)
-  drawTrendGraph(2, graphY, math.min(w - 3, 70), math.max(3, h - graphY - 8))
-
-  local bottomY = h - 8
-  hline(1, bottomY - 1, w, COLOR.border)
-  writeAt(2, bottomY, "TOP 3 ITEMS", COLOR.dim)
-  local top3 = topItems(3)
-  for i, rec in ipairs(top3) do
-    writeAt(2, bottomY + i, ("%d. %s"):format(i, rec.displayName), COLOR.text)
-    writeAt(30, bottomY + i, fmt(rec.count), COLOR.accent)
+  if row2 + 1 <= maxY then
+    statTile(2, row2, "LOW STOCK", tostring(lowN), lowN > 0 and COLOR.warn or COLOR.good)
+    local avg = uniqueItems > 0 and (totalItems / uniqueItems) or 0
+    statTile(2 + tileW, row2, "AVG STACK/ITEM", fmt(avg), COLOR.text)
+    local staleCount = 0
+    for _, s in ipairs(sources) do if s.stale then staleCount = staleCount + 1 end end
+    statTile(2 + tileW * 2, row2, "STALE SOURCES", tostring(staleCount), staleCount > 0 and COLOR.warn or COLOR.good)
   end
 
-  writeAt(45, bottomY, "TOP MOVERS (since last scan)", COLOR.dim)
-  local movers = topMovers(3)
-  if #movers == 0 then
-    writeAt(45, bottomY + 1, "No change", COLOR.dim)
+  local graphY = row2 + 3
+  if graphY + 1 <= maxY then
+    writeAt(2, graphY - 1, "TOTAL ITEM TREND", COLOR.dim)
+    drawTrendGraph(2, graphY, math.min(w - 3, 70))
   end
-  for i, m in ipairs(movers) do
-    local sign = m.delta > 0 and "+" or ""
-    local c = m.delta > 0 and COLOR.good or COLOR.bad
-    writeAt(45, bottomY + i, m.name, COLOR.text)
-    writeAt(70, bottomY + i, sign .. fmt(m.delta), c)
+
+  local bottomY = graphY + 4
+  if bottomY + 1 <= maxY then
+    hline(1, bottomY - 1, w, COLOR.border)
+    writeAt(2, bottomY, "TOP 3 ITEMS", COLOR.dim)
+    local top3 = topItems(3)
+    for i, rec in ipairs(top3) do
+      if bottomY + i <= maxY then
+        writeAt(2, bottomY + i, ("%d. %s"):format(i, rec.displayName), COLOR.text)
+        writeAt(cols.qty, bottomY + i, fmt(rec.count), COLOR.accent)
+      end
+    end
+
+    local secondColX = math.floor(w / 2) + 2
+    writeAt(secondColX, bottomY, "TOP MOVERS", COLOR.dim)
+    local movers = topMovers(3)
+    if #movers == 0 then
+      writeAt(secondColX, bottomY + 1, "No change", COLOR.dim)
+    end
+    for i, m in ipairs(movers) do
+      if bottomY + i <= maxY then
+        local sign = m.delta > 0 and "+" or ""
+        local c = m.delta > 0 and COLOR.good or COLOR.bad
+        writeAt(secondColX, bottomY + i, m.name, COLOR.text)
+        writeAt(math.min(w - 8, secondColX + 24), bottomY + i, sign .. fmt(m.delta), c)
+      end
+    end
   end
 end
 
 --------------------------------------------------------------------------
--- View: All Items (paginated, sortable, filterable by network)
+-- Item list (shared by Items / Top / Low tabs)
 --------------------------------------------------------------------------
 
 local function drawItemsList(w, h, list, topY, opts)
   opts = opts or {}
-  local rowsAvailable = h - topY - 2
-  local perPage = math.max(1, rowsAvailable)
+  local cols = columns(w)
+  local reserve = opts.paginated and 4 or 2
+  local rowsAvailable = math.max(1, h - topY - reserve)
+  local perPage = rowsAvailable
   local totalPages = math.max(1, math.ceil(#list / perPage))
   if ui.page > totalPages then ui.page = totalPages end
   local startIdx = (ui.page - 1) * perPage + 1
@@ -538,139 +603,157 @@ local function drawItemsList(w, h, list, topY, opts)
     local rec = list[idx]
     local y = topY + 1 + i
     if rec then
+      local maxNameLen = math.max(10, cols.qty - cols.name - 2)
       local nameStr = rec.displayName
-      if #nameStr > 34 then nameStr = nameStr:sub(1, 33) .. "…" end
+      if #nameStr > maxNameLen then nameStr = nameStr:sub(1, maxNameLen - 1) .. "…" end
       local color = COLOR.text
       if opts.lowColor and rec.count < CONFIG.lowStockThreshold then color = COLOR.warn end
-      writeAt(2, y, nameStr, color)
-      writeAt(38, y, fmt(rec.count), color)
+      writeAt(cols.name, y, nameStr, color)
+      writeAt(cols.qty, y, fmt(rec.count), color)
       if totalItems > 0 then
-        writeAt(50, y, string.format("%5.1f%%", rec.count / totalItems * 100), COLOR.dim)
+        writeAt(cols.pct, y, string.format("%5.1f%%", rec.count / totalItems * 100), COLOR.dim)
       end
-      if opts.showBar then
-        local barW = math.min(20, w - 62)
-        if barW > 0 and opts.maxForBar and opts.maxForBar > 0 then
-          local filled = math.floor((rec.count / opts.maxForBar) * barW + 0.5)
-          writeAt(60, y, string.rep(string.char(219), filled), COLOR.accent)
-        end
+      if opts.showBar and opts.maxForBar and opts.maxForBar > 0 then
+        local barW = math.max(0, w - cols.extra - 2)
+        local filled = math.floor((rec.count / opts.maxForBar) * barW + 0.5)
+        if filled > 0 then writeAt(cols.extra, y, string.rep(CH.block, filled), COLOR.accent) end
       end
     end
   end
   return totalPages
 end
 
-local function drawPagination(y, totalPages)
-  writeAt(2, y, "[ < Prev ]", COLOR.tabOnText, COLOR.button or colors.blue)
+local function drawPagination(y, w, totalPages)
+  writeAt(2, y, "[ < Prev ]", COLOR.tabOnText, COLOR.button)
   registerZone(2, y, 11, { type = "page", value = -1 })
   local label = ("Page %d/%d"):format(ui.page, totalPages)
   writeAt(13, y, label, COLOR.dim)
   local nextX = 13 + #label + 2
-  writeAt(nextX, y, "[ Next > ]", COLOR.tabOnText, colors.blue)
-  registerZone(nextX, y, nextX + 9, { type = "page", value = 1 })
+  if nextX + 9 <= w then
+    writeAt(nextX, y, "[ Next > ]", COLOR.tabOnText, COLOR.button)
+    registerZone(nextX, y, nextX + 9, { type = "page", value = 1 })
+  end
 end
 
-local function drawItemsView(w, h)
-  drawNetworkChips(4)
-  local listTop = 6
+--------------------------------------------------------------------------
+-- View: Items
+--------------------------------------------------------------------------
+
+local function drawItemsView(w, h, top)
+  local chipsY = top
+  local listTop = drawSourceChips(chipsY, w) + 1
+  local cols = columns(w)
+
   local function sortBtn(label, x, mode)
+    if x > w then return end
     local active = ui.sortMode == mode
     local text = "[" .. label .. "]"
     writeAt(x, listTop, text, active and COLOR.accent or COLOR.dim)
-    registerZone(x, listTop, x + #text - 1, { type = "sort", value = mode })
+    registerZone(x, listTop, math.min(w, x + #text - 1), { type = "sort", value = mode })
   end
-  writeAt(2, listTop, "ITEM", COLOR.dim)
-  writeAt(38, listTop, "QTY", COLOR.dim)
-  writeAt(50, listTop, "  % ", COLOR.dim)
-  sortBtn("Sort: Name", 60, "name")
-  sortBtn("Sort: Qty", 74, "qty")
+  writeAt(cols.name, listTop, "ITEM", COLOR.dim)
+  writeAt(cols.qty, listTop, "QTY", COLOR.dim)
+  writeAt(cols.pct, listTop, "  %  ", COLOR.dim)
+  sortBtn("Name", cols.extra, "name")
+  sortBtn("Qty", cols.extra + 8, "qty")
   hline(1, listTop + 1, w, COLOR.border)
 
   if ui.searchTerm then
-    writeAt(2, listTop - 1, "Filter (terminal): \"" .. ui.searchTerm .. "\"  (type 'clear' to reset)", COLOR.accent)
+    writeAt(2, listTop - 1, "Filter: \"" .. ui.searchTerm .. "\" (terminal: 'clear' to reset)", COLOR.accent)
   end
 
   local list = sortedFilteredItems()
-  local totalPages = drawItemsList(w, h, list, listTop + 1)
-  drawPagination(h - 3, totalPages)
+  local totalPages = drawItemsList(w, h, list, listTop + 1, { paginated = true })
+  drawPagination(h - 3, w, totalPages)
 end
 
 --------------------------------------------------------------------------
--- View: Top Items (bar chart style)
+-- View: Top Items
 --------------------------------------------------------------------------
 
-local function drawTopView(w, h)
-  writeAt(2, 5, ("TOP %d ITEMS BY QUANTITY"):format(CONFIG.topCount), COLOR.dim)
-  hline(1, 6, w, COLOR.border)
+local function drawTopView(w, h, top)
+  writeAt(2, top, ("TOP %d ITEMS BY QUANTITY"):format(CONFIG.topCount), COLOR.dim)
+  hline(1, top + 1, w, COLOR.border)
   local list = topItems(CONFIG.topCount)
   local maxV = list[1] and list[1].count or 1
-  drawItemsList(w, h, list, 6, { showBar = true, maxForBar = maxV })
+  drawItemsList(w, h, list, top + 1, { showBar = true, maxForBar = maxV })
 end
 
 --------------------------------------------------------------------------
 -- View: Low Stock
 --------------------------------------------------------------------------
 
-local function drawLowView(w, h)
+local function drawLowView(w, h, top)
   local list, totalLow = lowStockItems(nil)
-  writeAt(2, 5, ("LOW STOCK (below %d) - %d item(s)"):format(CONFIG.lowStockThreshold, totalLow), COLOR.warn)
-  hline(1, 6, w, COLOR.border)
+  writeAt(2, top, ("LOW STOCK (below %d) - %d item(s)"):format(CONFIG.lowStockThreshold, totalLow), COLOR.warn)
+  hline(1, top + 1, w, COLOR.border)
   if totalLow == 0 then
-    writeAt(2, 8, "Nothing is low on stock right now.", COLOR.good)
+    writeAt(2, top + 3, "Nothing is low on stock right now.", COLOR.good)
     return
   end
-  local totalPages = drawItemsList(w, h, list, 6, { lowColor = true })
-  drawPagination(h - 3, totalPages)
+  local totalPages = drawItemsList(w, h, list, top + 1, { lowColor = true, paginated = true })
+  drawPagination(h - 3, w, totalPages)
 end
 
 --------------------------------------------------------------------------
 -- View: Movers
 --------------------------------------------------------------------------
 
-local function drawMoversView(w, h)
-  writeAt(2, 5, "BIGGEST CHANGES SINCE LAST SCAN", COLOR.dim)
-  hline(1, 6, w, COLOR.border)
+local function drawMoversView(w, h, top)
+  writeAt(2, top, "BIGGEST CHANGES SINCE LAST SCAN", COLOR.dim)
+  hline(1, top + 1, w, COLOR.border)
   local movers = topMovers(CONFIG.moversCount)
   if #movers == 0 then
-    writeAt(2, 8, "No changes detected on the last scan.", COLOR.dim)
+    writeAt(2, top + 3, "No changes detected on the last scan.", COLOR.dim)
     return
   end
+  local cols = columns(w)
   for i, m in ipairs(movers) do
-    local y = 7 + i
-    local sign = m.delta > 0 and "+" or ""
-    local c = m.delta > 0 and COLOR.good or COLOR.bad
-    local nameStr = m.name
-    if #nameStr > 34 then nameStr = nameStr:sub(1, 33) .. "…" end
-    writeAt(2, y, nameStr, COLOR.text)
-    writeAt(38, y, sign .. fmt(m.delta), c)
-    writeAt(52, y, "now " .. fmt(m.count), COLOR.dim)
+    local y = top + 1 + i
+    if y < h - 1 then
+      local sign = m.delta > 0 and "+" or ""
+      local c = m.delta > 0 and COLOR.good or COLOR.bad
+      local maxNameLen = math.max(10, cols.qty - 2)
+      local nameStr = m.name
+      if #nameStr > maxNameLen then nameStr = nameStr:sub(1, maxNameLen - 1) .. "…" end
+      writeAt(2, y, nameStr, COLOR.text)
+      writeAt(cols.qty, y, sign .. fmt(m.delta), c)
+      writeAt(cols.pct, y, "now " .. fmt(m.count), COLOR.dim)
+    end
   end
 end
 
 --------------------------------------------------------------------------
--- View: Sources
+-- View: Vaults / Sources
 --------------------------------------------------------------------------
 
-local function drawSourcesView(w, h)
-  writeAt(2, 5, ("%d CONNECTED NETWORK(S)"):format(#sources), COLOR.dim)
-  hline(1, 6, w, COLOR.border)
+local function drawSourcesView(w, h, top)
+  writeAt(2, top, ("%d CONNECTED SOURCE(S)"):format(#sources), COLOR.dim)
+  hline(1, top + 1, w, COLOR.border)
   if #sources == 0 then
-    writeAt(2, 8, "No Create_StockTicker peripherals detected.", COLOR.bad)
-    writeAt(2, 9, "Attach one via wired modem and bind it to a Stock Link.", COLOR.dim)
+    writeAt(2, top + 3, "No inventories or Stock Tickers detected.", COLOR.bad)
+    writeAt(2, top + 4, "Wire a modem to a Vault (or Stock Ticker) and it'll show up here.", COLOR.dim)
     return
   end
+  local y = top + 2
   for i, src in ipairs(sources) do
-    local y = 6 + (i - 1) * 3 + 1
+    if y + 1 >= h - 1 then break end
     local uniqueForSrc, totalForSrc = 0, 0
     for _, rec in pairs(items) do
       local c = rec.perSource[src.label]
       if c then uniqueForSrc = uniqueForSrc + 1; totalForSrc = totalForSrc + c end
     end
     local statusColor = src.stale and COLOR.bad or COLOR.good
-    local statusText = src.stale and "STALE (last good data shown)" or "ONLINE"
+    local statusText = src.stale and "STALE" or "ONLINE"
     writeAt(2, y, ("[%d] %s"):format(i, src.label), COLOR.title)
-    writeAt(45, y, statusText, statusColor)
-    writeAt(2, y + 1, ("  peripheral: %s   items: %s   unique: %s"):format(
-      src.name, fmt(totalForSrc), fmt(uniqueForSrc)), COLOR.dim)
+    writeAt(math.max(30, w - 12), y, statusText, statusColor)
+    local detail = ("  %s | items %s | unique %s"):format(
+      src.kind == "stockTicker" and "network" or "vault", fmt(totalForSrc), fmt(uniqueForSrc))
+    if src.kind == "inventory" and src.slots then
+      detail = detail .. ("  | slots %d/%d"):format(src.usedSlots or 0, src.slots)
+    end
+    writeAt(2, y + 1, detail, COLOR.dim)
+    y = y + 3
   end
 end
 
@@ -684,14 +767,14 @@ local function render()
   mon.setBackgroundColor(COLOR.bg)
   mon.clear()
 
-  drawHeader(w)
+  local top = drawHeader(w)
 
-  if ui.view == "overview" then drawOverview(w, h)
-  elseif ui.view == "items" then drawItemsView(w, h)
-  elseif ui.view == "top" then drawTopView(w, h)
-  elseif ui.view == "low" then drawLowView(w, h)
-  elseif ui.view == "movers" then drawMoversView(w, h)
-  elseif ui.view == "sources" then drawSourcesView(w, h)
+  if ui.view == "overview" then drawOverview(w, h, top)
+  elseif ui.view == "items" then drawItemsView(w, h, top)
+  elseif ui.view == "top" then drawTopView(w, h, top)
+  elseif ui.view == "low" then drawLowView(w, h, top)
+  elseif ui.view == "movers" then drawMoversView(w, h, top)
+  elseif ui.view == "sources" then drawSourcesView(w, h, top)
   end
 
   drawFooter(h, w)
@@ -707,7 +790,7 @@ local function printHelp()
   print("  search <text>   - filter items by name (Items view)")
   print("  clear           - clear filter")
   print("  sort name|qty")
-  print("  sources         - list connected vault networks")
+  print("  sources         - list connected vaults/networks")
   print("  refresh         - force an immediate rescan")
   print("  help            - show this message")
 end
@@ -812,9 +895,9 @@ local function main()
   findMonitor()
   discoverSources()
   if #sources == 0 then
-    print("WARNING: no Create_StockTicker peripherals found.")
-    print("Attach a Stock Ticker via wired modem, bind it to a Stock Link,")
-    print("and this program will pick it up automatically (or press refresh).")
+    print("WARNING: no inventories or Stock Tickers found.")
+    print("Wire a modem to a Vault (or Stock Ticker) and this program will")
+    print("pick it up automatically (or use the 'refresh' command).")
   end
   scanAll()
   render()
