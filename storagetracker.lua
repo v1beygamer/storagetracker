@@ -1,11 +1,13 @@
 --------------------------------------------------------------------------
 -- STORAGE NETWORK MONITOR
--- Per-vault mode: wire a Wired Modem directly to each Create Item Vault
--- (and/or chest/barrel) you want tracked -- CC:Tweaked sees each as a
--- generic "inventory" peripheral, giving a true per-vault breakdown
--- instead of a network-wide aggregate. Create_StockTicker peripherals
--- (whole Logistics Network totals) are still supported and can be mixed
--- in alongside individual vaults.
+-- Reads Create (6.0+) Logistics Networks via one or more Stock Tickers
+-- (bound to Vaults through Stock Links). Note: Item Vaults do NOT expose
+-- their contents through the standard inventory capability (list() always
+-- comes back empty even though size() reports real slots) -- only Chutes/
+-- Funnels/Item Hatches/Stock Links can see inside one, so Stock Ticker
+-- (whole-network totals) is the only way CC:Tweaked can read them. Plain
+-- chests/barrels CAN be wired directly as generic "inventory" peripherals
+-- if you want to mix those in too (see CONFIG.includeInventories).
 --
 -- Controls:
 --   Monitor (touch)   - switch tabs, page through items, sort, filter by
@@ -23,8 +25,13 @@ local CONFIG = {
   lowStockThreshold       = 64,    -- items below this count are flagged low
   topCount                = 15,    -- how many items to show on the Top tab
   moversCount             = 15,    -- how many items to show on the Movers tab
-  includeInventories      = true,  -- scan generic "inventory" peripherals (Vaults, chests, barrels...)
-  includeStockTickers     = true,  -- also scan Create_StockTicker peripherals (whole-network totals)
+  -- NOTE: Create's Item Vault does NOT expose its contents through the
+  -- standard inventory capability (confirmed: size() reports slots but
+  -- list() always comes back empty) -- only Chutes/Funnels/Item Hatches/
+  -- Stock Links can see inside one. Leave this off unless you're wiring
+  -- a plain chest/barrel/etc, which DOES work as a generic inventory.
+  includeInventories      = false,
+  includeStockTickers     = true,  -- Create_StockTicker peripherals (Logistics Network totals) -- the only way to read Vault contents
   monitorScale            = 1,     -- 1 = normal readable size
   -- Give friendly names to specific peripherals, e.g.
   --   ["inventory_3"] = "Iron Farm Vault",
@@ -89,7 +96,7 @@ local monitor, mon
 local function friendlyLabel(name, kind, index)
   if CONFIG.sourceLabels[name] then return CONFIG.sourceLabels[name] end
   if kind == "stockTicker" then return ("Network #%d"):format(index) end
-  return ("Vault #%d"):format(index)
+  return ("Inventory #%d"):format(index)
 end
 
 local function discoverSources()
@@ -287,7 +294,7 @@ local TABS = {
   { id = "top",      label = "Top" },
   { id = "low",      label = "Low" },
   { id = "movers",   label = "Movers" },
-  { id = "sources",  label = "Vaults" },
+  { id = "sources",  label = "Sources" },
 }
 
 local ui = {
@@ -724,7 +731,7 @@ local function drawMoversView(w, h, top)
 end
 
 --------------------------------------------------------------------------
--- View: Vaults / Sources
+-- View: Sources
 --------------------------------------------------------------------------
 
 local function drawSourcesView(w, h, top)
@@ -732,7 +739,7 @@ local function drawSourcesView(w, h, top)
   hline(1, top + 1, w, COLOR.border)
   if #sources == 0 then
     writeAt(2, top + 3, "No inventories or Stock Tickers detected.", COLOR.bad)
-    writeAt(2, top + 4, "Wire a modem to a Vault (or Stock Ticker) and it'll show up here.", COLOR.dim)
+    writeAt(2, top + 4, "Wire a modem to a Stock Ticker bound to a Stock Link and it'll show up here.", COLOR.dim)
     return
   end
   local y = top + 2
@@ -748,7 +755,7 @@ local function drawSourcesView(w, h, top)
     writeAt(2, y, ("[%d] %s"):format(i, src.label), COLOR.title)
     writeAt(math.max(30, w - 12), y, statusText, statusColor)
     local detail = ("  %s | items %s | unique %s"):format(
-      src.kind == "stockTicker" and "network" or "vault", fmt(totalForSrc), fmt(uniqueForSrc))
+      src.kind == "stockTicker" and "network" or "inventory", fmt(totalForSrc), fmt(uniqueForSrc))
     if src.kind == "inventory" and src.slots then
       detail = detail .. ("  | slots %d/%d"):format(src.usedSlots or 0, src.slots)
     end
@@ -790,7 +797,7 @@ local function printHelp()
   print("  search <text>   - filter items by name (Items view)")
   print("  clear           - clear filter")
   print("  sort name|qty")
-  print("  sources         - list connected vaults/networks")
+  print("  sources         - list connected networks/inventories")
   print("  refresh         - force an immediate rescan")
   print("  help            - show this message")
 end
@@ -895,9 +902,9 @@ local function main()
   findMonitor()
   discoverSources()
   if #sources == 0 then
-    print("WARNING: no inventories or Stock Tickers found.")
-    print("Wire a modem to a Vault (or Stock Ticker) and this program will")
-    print("pick it up automatically (or use the 'refresh' command).")
+    print("WARNING: no Stock Tickers (or inventories) found.")
+    print("Wire a modem to a Stock Ticker bound to a Stock Link and this")
+    print("program will pick it up automatically (or use 'refresh').")
   end
   scanAll()
   render()
